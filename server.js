@@ -14,7 +14,7 @@ const JIRA_BASE_URL = process.env.JIRA_BASE_URL;
 const JIRA_EMAIL = process.env.JIRA_EMAIL;
 const JIRA_API_TOKEN = process.env.JIRA_API_TOKEN;
 
-// 🔥 アクション内容フィールドID
+// ===== アクション内容フィールドID =====
 const ACTION_FIELD_ID = "customfield_10118";
 
 // ===== 認証 =====
@@ -29,11 +29,18 @@ function getJiraHeaders() {
 
 // ===== LINE返信 =====
 async function replyLine(replyToken, message) {
-  await axios.post(
+  console.log("LINE REPLY TRY:", { replyToken, message });
+
+  const response = await axios.post(
     "https://api.line.me/v2/bot/message/reply",
     {
       replyToken,
-      messages: [{ type: "text", text: message }]
+      messages: [
+        {
+          type: "text",
+          text: message
+        }
+      ]
     },
     {
       headers: {
@@ -42,6 +49,8 @@ async function replyLine(replyToken, message) {
       }
     }
   );
+
+  console.log("LINE REPLY OK:", response.status);
 }
 
 // ===== メッセージ解析 =====
@@ -90,8 +99,6 @@ async function createJira(task) {
     summary: task.summary,
     issuetype: { name: task.issueType },
     duedate: task.dueDate,
-
-    // 🔥 アクション内容に入れる
     [ACTION_FIELD_ID]: task.description || ""
   };
 
@@ -100,30 +107,50 @@ async function createJira(task) {
     fields.assignee = { accountId };
   }
 
+  console.log("JIRA CREATE FIELDS:", JSON.stringify(fields, null, 2));
+
   const res = await axios.post(
     `${JIRA_BASE_URL}/rest/api/3/issue`,
     { fields },
     { headers: getJiraHeaders() }
   );
 
+  console.log("JIRA CREATE OK:", res.data);
+
   return res.data;
 }
 
 // ===== Webhook =====
 app.post("/webhook", async (req, res) => {
+  console.log("WEBHOOK BODY:", JSON.stringify(req.body, null, 2));
+
   const events = req.body.events || [];
 
   for (const e of events) {
     if (e.type !== "message") continue;
+    if (!e.message || e.message.type !== "text") continue;
 
     try {
+      console.log("RAW TEXT:", e.message.text);
+      console.log("REPLY TOKEN:", e.replyToken);
+
       const task = parseMessage(e.message.text);
       const result = await createJira(task);
 
       await replyLine(e.replyToken, `作成成功: ${result.key}`);
     } catch (err) {
-      console.error(err.response?.data || err.message);
-      await replyLine(e.replyToken, `失敗: ${err.message}`);
+      console.error("ERROR MESSAGE:", err.message);
+      console.error("ERROR DATA:", err.response?.data || "no response data");
+
+      try {
+        await replyLine(e.replyToken, `失敗: ${err.message}`);
+      } catch (replyErr) {
+        console.error("LINE REPLY ERROR:", replyErr.message);
+        console.error(
+          "LINE REPLY ERROR DATA:",
+          replyErr.response?.data || "no response data"
+        );
+      }
     }
   }
 
