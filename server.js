@@ -14,12 +14,22 @@ const JIRA_BASE_URL = process.env.JIRA_BASE_URL;
 const JIRA_EMAIL = process.env.JIRA_EMAIL;
 const JIRA_API_TOKEN = process.env.JIRA_API_TOKEN;
 
+// ===== 共通認証ヘッダー =====
+function getJiraHeaders() {
+  const auth = Buffer.from(`${JIRA_EMAIL}:${JIRA_API_TOKEN}`).toString("base64");
+  return {
+    Authorization: `Basic ${auth}`,
+    Accept: "application/json",
+    "Content-Type": "application/json"
+  };
+}
+
 // ===== LINE返信 =====
 async function replyLine(replyToken, message) {
   await axios.post(
     "https://api.line.me/v2/bot/message/reply",
     {
-      replyToken: replyToken,
+      replyToken,
       messages: [
         {
           type: "text",
@@ -38,7 +48,8 @@ async function replyLine(replyToken, message) {
 
 // ===== メッセージ解析 =====
 function parseMessage(text) {
-  const parts = text.split("|");
+  const cleaned = text.replace(/\n/g, "").trim();
+  const parts = cleaned.split("|").map((p) => p.trim());
 
   if (parts.length < 6) {
     throw new Error("形式: プロジェクト | 種別 | 件名 | 期限 | 担当 | 詳細");
@@ -54,62 +65,90 @@ function parseMessage(text) {
   };
 }
 
+// ===== Jiraユーザー検索 → accountId取得 =====
+async function resolveAssigneeAccountId(query) {
+  if (!query) return null;
+
+  const response = await axios.get(
+    `${JIRA_BASE_URL}/rest/api/3/user/search`,
+    {
+      headers: getJiraHeaders(),
+      params: { query }
+    }
+  );
+
+  const users = response.data || [];
+  if (!users.length) return null;
+
+  const normalized = query.trim().toLowerCase();
+
+  const exactDisplayName = users.find(
+    (u) => (u.displayName || "").trim().toLowerCase() === normalized
+  );
+  if (exactDisplayName) return exactDisplayName.accountId;
+
+  const exactEmail = users.find(
+    (u) => (u.emailAddress || "").trim().toLowerCase() === normalized
+  );
+  if (exactEmail) return exactEmail.accountId;
+
+  return users[0].accountId;
+}
+
 // ===== Jira作成 =====
 async function createJira(task) {
-  const auth = Buffer.from(
-    `${JIRA_EMAIL}:${JIRA_API_TOKEN}`
-  ).toString("base64");
+  const assigneeAccountId = await resolveAssigneeAccountId(task.assignee);
 
-  const payload = {
-    fields: {
-      project: { key: task.projectKey },
-      summary: task.summary,
-      issuetype: { name: task.issueType },
-
-      // ★期限追加
-      duedate: task.dueDate,
-
-      // ★descriptionはADF形式
-      description: {
-        type: "doc",
-        version: 1,
-        content: [
-          {
-            type: "paragraph",
-            content: [
-              {
-                type: "text",
-                text: task.description || ""
-              }
-            ]
-          }
-        ]
-      }
+  const fields = {
+    project: { key: task.projectKey },
+    summary: task.summary,
+    issuetype: { name: task.issueType },
+    duedate: task.dueDate,
+    description: {
+      type: "doc",
+      version: 1,
+      content: [
+        {
+          type: "paragraph",
+          content: [
+            {
+              type: "text",
+              text: task.description || ""
+            }
+          ]
+        }
+      ]
     }
   };
+
+  if (assigneeAccountId) {
+    fields.assignee = { accountId: assigneeAccountId };
+  }
+
+  const payload = { fields };
 
   const response = await axios.post(
     `${JIRA_BASE_URL}/rest/api/3/issue`,
     payload,
     {
-      headers: {
-        Authorization: `Basic ${auth}`,
-        Accept: "application/json",
-        "Content-Type": "application/json"
-      }
+      headers: getJiraHeaders()
     }
   );
 
-  return response.data;
+  return {
+    key: response.data.key,
+    assigneeResolved: Boolean(assigneeAccountId)
+  };
 }
 
 // ===== Webhook =====
 app.post("/webhook", async (req, res) => {
   try {
-    const events = req.body.events;
+    const events = req.body.events || [];
 
     for (const e of events) {
       if (e.type !== "message") continue;
+      if (!e.message || e.message.type !== "text") continue;
 
       try {
         const text = e.message.text;
@@ -118,7 +157,11 @@ app.post("/webhook", async (req, res) => {
         const task = parseMessage(text);
         const result = await createJira(task);
 
-        await replyLine(e.replyToken, `作成成功: ${result.key}`);
+        const msg = result.assigneeResolved
+          ? `作成成功: ${result.key}`
+          : `作成成功: ${result.key}（担当者は未設定）`;
+
+        await replyLine(e.replyToken, msg);
       } catch (err) {
         console.error("ERROR MESSAGE:", err.message);
         console.error(
