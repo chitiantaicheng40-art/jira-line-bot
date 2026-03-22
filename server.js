@@ -65,9 +65,11 @@ function parseMessage(text) {
   };
 }
 
-// ===== Jiraユーザー検索 → accountId取得 =====
+// ===== Jiraユーザー検索 → accountId取得（完全一致のみ） =====
 async function resolveAssigneeAccountId(query) {
   if (!query) return null;
+
+  const normalized = query.trim().toLowerCase();
 
   const response = await axios.get(
     `${JIRA_BASE_URL}/rest/api/3/user/search`,
@@ -78,27 +80,32 @@ async function resolveAssigneeAccountId(query) {
   );
 
   const users = response.data || [];
-  if (!users.length) return null;
 
-  const normalized = query.trim().toLowerCase();
+  console.log(
+    "USER SEARCH RESULT:",
+    JSON.stringify(
+      users.map((u) => ({
+        displayName: u.displayName,
+        accountId: u.accountId
+      })),
+      null,
+      2
+    )
+  );
 
   const exactDisplayName = users.find(
     (u) => (u.displayName || "").trim().toLowerCase() === normalized
   );
-  if (exactDisplayName) return exactDisplayName.accountId;
 
-  const exactEmail = users.find(
-    (u) => (u.emailAddress || "").trim().toLowerCase() === normalized
-  );
-  if (exactEmail) return exactEmail.accountId;
+  if (!exactDisplayName) {
+    throw new Error(`担当者が見つかりません: ${query}`);
+  }
 
-  return users[0].accountId;
+  return exactDisplayName.accountId;
 }
 
 // ===== Jira作成 =====
 async function createJira(task) {
-  const assigneeAccountId = await resolveAssigneeAccountId(task.assignee);
-
   const fields = {
     project: { key: task.projectKey },
     summary: task.summary,
@@ -121,11 +128,14 @@ async function createJira(task) {
     }
   };
 
-  if (assigneeAccountId) {
+  if (task.assignee) {
+    const assigneeAccountId = await resolveAssigneeAccountId(task.assignee);
     fields.assignee = { accountId: assigneeAccountId };
   }
 
   const payload = { fields };
+
+  console.log("JIRA PAYLOAD:", JSON.stringify(payload, null, 2));
 
   const response = await axios.post(
     `${JIRA_BASE_URL}/rest/api/3/issue`,
@@ -135,10 +145,7 @@ async function createJira(task) {
     }
   );
 
-  return {
-    key: response.data.key,
-    assigneeResolved: Boolean(assigneeAccountId)
-  };
+  return response.data;
 }
 
 // ===== Webhook =====
@@ -157,11 +164,7 @@ app.post("/webhook", async (req, res) => {
         const task = parseMessage(text);
         const result = await createJira(task);
 
-        const msg = result.assigneeResolved
-          ? `作成成功: ${result.key}`
-          : `作成成功: ${result.key}（担当者は未設定）`;
-
-        await replyLine(e.replyToken, msg);
+        await replyLine(e.replyToken, `作成成功: ${result.key}`);
       } catch (err) {
         console.error("ERROR MESSAGE:", err.message);
         console.error(
