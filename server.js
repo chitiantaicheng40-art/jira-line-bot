@@ -9,7 +9,6 @@ const PORT = process.env.PORT || 3001;
 
 // ===== 環境変数 =====
 const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
-const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
 
 const JIRA_BASE_URL = process.env.JIRA_BASE_URL;
 const JIRA_EMAIL = process.env.JIRA_EMAIL;
@@ -67,7 +66,10 @@ async function createJira(task) {
       summary: task.summary,
       issuetype: { name: task.issueType },
 
-      // ★ここが重要（ADF形式）
+      // ★期限追加
+      duedate: task.dueDate,
+
+      // ★descriptionはADF形式
       description: {
         type: "doc",
         version: 1,
@@ -83,10 +85,6 @@ async function createJira(task) {
           }
         ]
       }
-
-      // ↓まずはシンプルにする（後で拡張）
-      // duedate: task.dueDate,
-      // assignee: { accountId: task.assignee }
     }
   };
 
