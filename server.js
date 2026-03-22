@@ -1,150 +1,123 @@
 require("dotenv").config();
 const express = require("express");
+const axios = require("axios");
 const crypto = require("crypto");
 
 const app = express();
+app.use(express.json());
 
-// raw body for LINE signature
-app.use(
-  express.json({
-    verify: (req, res, buf) => {
-      req.rawBody = buf;
-    },
-  })
-);
+const PORT = process.env.PORT || 3001;
 
-const PORT = process.env.PORT || 10000;
-
-// ===== ENV =====
-const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
+// ===== LINE設定 =====
 const LINE_CHANNEL_SECRET = process.env.LINE_CHANNEL_SECRET;
+const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 
-const JIRA_BASE_URL = (process.env.JIRA_BASE_URL || "").trim().replace(/\/+$/, "");
+// ===== Jira設定 =====
 const JIRA_EMAIL = process.env.JIRA_EMAIL;
 const JIRA_API_TOKEN = process.env.JIRA_API_TOKEN;
+const JIRA_BASE_URL = process.env.JIRA_BASE_URL;
 
-// ===== MAP =====
-const PROJECT_MAP = {
-  OPS: "OPS",
-  PRODUCT: "PRODUCT",
-  SALES: "SALES",
-  契約状況: "契約状況",
-};
-
-// 担当は一旦なしでもOK
-const JIRA_USER_MAP = {};
-
-// ===== LINE署名 =====
-function verifyLineSignature(req) {
+// ===== LINE署名検証 =====
+function validateSignature(req) {
   const signature = req.headers["x-line-signature"];
-  if (!signature) return false;
+  const body = JSON.stringify(req.body);
 
   const hash = crypto
-    .createHmac("SHA256", LINE_CHANNEL_SECRET)
-    .update(req.rawBody)
+    .createHmac("sha256", LINE_CHANNEL_SECRET)
+    .update(body)
     .digest("base64");
 
-  return signature === hash;
+  return hash === signature;
 }
 
 // ===== LINE返信 =====
-async function replyLine(replyToken, text) {
-  await fetch("https://api.line.me/v2/bot/message/reply", {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
-    },
-    body: JSON.stringify({
+async function replyLine(replyToken, message) {
+  await axios.post(
+    "https://api.line.me/v2/bot/message/reply",
+    {
       replyToken,
-      messages: [{ type: "text", text }],
-    }),
-  });
+      messages: [{ type: "text", text: message }],
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+    }
+  );
 }
 
-// ===== パース =====
+// ===== メッセージ解析（超重要：修正版）=====
 function parseMessage(text) {
-  const parts = text.split("｜");
+  // 👇 ここが今回の核心修正
+  const cleaned = text.replace(/\n/g, "").trim();
+  const parts = cleaned.split("|").map((p) => p.trim());
 
-  if (parts.length < 6) {
-    throw new Error("形式: プロジェクト｜種別｜件名｜期限｜担当｜詳細");
+  if (parts.length !== 6) {
+    throw new Error("形式: プロジェクト | 種別 | 件名 | 期限 | 担当 | 詳細");
   }
 
   return {
-    projectKey: PROJECT_MAP[parts[0]] || parts[0],
+    projectKey: parts[0],
     issueType: parts[1],
     summary: parts[2],
     dueDate: parts[3],
-    description: parts.slice(5).join("｜"),
+    assignee: parts[4],
+    description: parts[5],
   };
 }
 
 // ===== Jira作成 =====
 async function createJira(task) {
-  const url = `${JIRA_BASE_URL}/rest/api/3/issue`;
+  const auth = Buffer.from(
+    `${JIRA_EMAIL}:${JIRA_API_TOKEN}`
+  ).toString("base64");
 
-  console.log("JIRA URL =", url);
-
-  const auth = Buffer.from(`${JIRA_EMAIL}:${JIRA_API_TOKEN}`).toString("base64");
-
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Basic ${auth}`,
-    },
-    body: JSON.stringify({
+  const response = await axios.post(
+    `${JIRA_BASE_URL}/rest/api/3/issue`,
+    {
       fields: {
         project: { key: task.projectKey },
         summary: task.summary,
+        description: task.description,
         issuetype: { name: task.issueType },
-        duedate: task.dueDate,
-        description: {
-          type: "doc",
-          version: 1,
-          content: [
-            {
-              type: "paragraph",
-              content: [{ type: "text", text: task.description }],
-            },
-          ],
-        },
       },
-    }),
-  });
+    },
+    {
+      headers: {
+        Authorization: `Basic ${auth}`,
+        "Content-Type": "application/json",
+      },
+    }
+  );
 
-  const text = await res.text();
-  console.log("Jira status =", res.status);
-  console.log("Jira body =", text);
-
-  if (!res.ok) {
-    throw new Error(text);
-  }
-
-  return JSON.parse(text);
+  return response.data;
 }
 
 // ===== Webhook =====
 app.post("/webhook", async (req, res) => {
   try {
-    console.log("=== LINE WEBHOOK ===");
-
-    if (!verifyLineSignature(req)) {
-      return res.status(401).send("invalid");
+    if (!validateSignature(req)) {
+      return res.status(401).send("Invalid signature");
     }
 
-    const events = req.body.events || [];
+    const events = req.body.events;
 
     for (const e of events) {
       if (e.type !== "message") continue;
+
+      // 👇 デバッグ（今回の原因特定用）
+      console.log("RAW TEXT:", JSON.stringify(e.message.text));
 
       try {
         const task = parseMessage(e.message.text);
         const result = await createJira(task);
 
+        console.log("Created Jira issue:", result.key);
+
         await replyLine(e.replyToken, `作成成功: ${result.key}`);
       } catch (err) {
-        console.error(err.message);
+        console.error("ERROR:", err.message);
         await replyLine(e.replyToken, `失敗: ${err.message}`);
       }
     }
@@ -156,6 +129,7 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
+// ===== 起動 =====
 app.listen(PORT, () => {
   console.log("Server running:", PORT);
 });
