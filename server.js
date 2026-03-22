@@ -17,12 +17,9 @@ const JIRA_API_TOKEN = process.env.JIRA_API_TOKEN;
 
 // ===== Middleware =====
 app.use("/webhook", express.json());
-app.use("/jira", express.json());
 app.use("/callback", express.raw({ type: "*/*" }));
 
-app.get("/", (req, res) => {
-  res.status(200).send("OK");
-});
+app.get("/", (req, res) => res.send("OK"));
 
 // ===== LINE署名検証 =====
 function validateLineSignature(body, signature) {
@@ -36,25 +33,20 @@ function validateLineSignature(body, signature) {
 // ===== 名前 → Jira accountId =====
 const ASSIGNEE_MAP = {
   "池田太晟": "712020:49c2350d-16fc-457e-8b2b-159df43d77ad",
-  "金澤将一": "ここに金澤さんのJira accountId", // ←後で入れる
+  "金澤将一": "6121089528ae75006afc73b3",
 };
 
-// ===== 名前 → LINE userId（今回は全部あなたに送る）=====
+// ===== 名前 → LINE userId =====
 const LINE_USER_MAP = {
   "池田太晟": "Uba56ca108dd44ab8cd3b044670958c34",
-  "金澤将一": "Uba56ca108dd44ab8cd3b044670958c34",
+  "金澤将一": "U743062d8c9d606c8a30c971bf1a650c5",
 };
 
 // ===== LINE送信 =====
 async function pushLineMessageTo(userId, text) {
-  if (!userId) {
-    throw new Error("LINE userId is empty");
-  }
+  if (!userId) return;
 
-  console.log("LINE PUSH TO:", userId);
-  console.log("LINE PUSH TEXT:", text);
-
-  const res = await axios.post(
+  await axios.post(
     "https://api.line.me/v2/bot/message/push",
     {
       to: userId,
@@ -62,18 +54,16 @@ async function pushLineMessageTo(userId, text) {
     },
     {
       headers: {
-        "Content-Type": "application/json",
         Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
+        "Content-Type": "application/json",
       },
     }
   );
-
-  console.log("LINE PUSH OK:", res.status);
 }
 
 // ===== LINE返信 =====
 async function replyLineMessage(replyToken, text) {
-  const res = await axios.post(
+  await axios.post(
     "https://api.line.me/v2/bot/message/reply",
     {
       replyToken,
@@ -81,22 +71,18 @@ async function replyLineMessage(replyToken, text) {
     },
     {
       headers: {
-        "Content-Type": "application/json",
         Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
+        "Content-Type": "application/json",
       },
     }
   );
-
-  console.log("LINE REPLY OK:", res.status);
 }
 
 // ===== Jira作成 =====
 async function createJiraIssueFromText(rawText) {
-  console.log("RAW TEXT:", rawText);
-
   const parts = rawText.split("|");
   if (parts.length < 6) {
-    throw new Error("形式エラー: PROJECT|IssueType|Summary|DueDate|Assignee|Description");
+    throw new Error("形式エラー");
   }
 
   const [projectKey, issueType, summary, dueDate, assigneeName, description] = parts;
@@ -116,20 +102,7 @@ async function createJiraIssueFromText(rawText) {
 
   if (projectKey === "OPS") {
     fields.customfield_10118 = description;
-  } else {
-    fields.description = {
-      type: "doc",
-      version: 1,
-      content: [
-        {
-          type: "paragraph",
-          content: [{ type: "text", text: description }],
-        },
-      ],
-    };
   }
-
-  console.log("JIRA CREATE FIELDS:", JSON.stringify(fields, null, 2));
 
   const res = await axios.post(
     `${JIRA_BASE_URL}/rest/api/3/issue`,
@@ -139,66 +112,44 @@ async function createJiraIssueFromText(rawText) {
         username: JIRA_EMAIL,
         password: JIRA_API_TOKEN,
       },
-      headers: {
-        Accept: "application/json",
-        "Content-Type": "application/json",
-      },
     }
   );
 
-  console.log("JIRA CREATE OK:", res.data);
   return res.data;
 }
 
 // ===== LINE → Jira =====
 app.post("/callback", async (req, res) => {
-  try {
-    const signature = req.headers["x-line-signature"];
-    const rawBody = req.body;
+  const signature = req.headers["x-line-signature"];
+  const rawBody = req.body;
 
-    if (!validateLineSignature(rawBody, signature)) {
-      return res.status(401).send("Invalid signature");
-    }
-
-    const body = JSON.parse(rawBody.toString("utf8"));
-    console.log("=== LINE WEBHOOK ===");
-    console.log(JSON.stringify(body, null, 2));
-
-    const events = body.events || [];
-    for (const event of events) {
-      if (event.type !== "message" || event.message.type !== "text") continue;
-
-      const text = event.message.text.trim();
-
-      try {
-        const jira = await createJiraIssueFromText(text);
-        await replyLineMessage(event.replyToken, `Jira作成OK: ${jira.key}`);
-      } catch (err) {
-        console.error("CREATE ERROR:", err.response?.data || err.message);
-        await replyLineMessage(event.replyToken, `作成失敗: ${err.message}`);
-      }
-    }
-
-    res.status(200).send("OK");
-  } catch (error) {
-    console.error("LINE CALLBACK ERROR:", error.message);
-    res.status(500).send("ERROR");
+  if (!validateLineSignature(rawBody, signature)) {
+    return res.status(401).send("Invalid signature");
   }
+
+  const body = JSON.parse(rawBody.toString("utf8"));
+
+  for (const event of body.events) {
+    if (event.type !== "message") continue;
+
+    const text = event.message.text;
+
+    try {
+      const jira = await createJiraIssueFromText(text);
+      await replyLineMessage(event.replyToken, `作成成功: ${jira.key}`);
+    } catch (e) {
+      await replyLineMessage(event.replyToken, `エラー: ${e.message}`);
+    }
+  }
+
+  res.send("OK");
 });
 
 // ===== Jira → LINE通知 =====
 app.post("/webhook", async (req, res) => {
-  try {
-    console.log("=== JIRA WEBHOOK ===");
-    console.log(JSON.stringify(req.body, null, 2));
+  const { issueKey, summary, assignee, priority, status } = req.body;
 
-    const issueKey = req.body.issueKey;
-    const summary = req.body.summary;
-    const assignee = req.body.assignee;
-    const priority = req.body.priority;
-    const status = req.body.status;
-
-    const message =
+  const message =
 `【期限超過タスク⚠️】
 キー: ${issueKey}
 タイトル: ${summary}
@@ -206,30 +157,20 @@ app.post("/webhook", async (req, res) => {
 優先度: ${priority}
 ステータス: ${status}`;
 
-    const targets = new Set();
+  const targets = new Set();
 
-    // 固定通知（残す）
-    if (LINE_USER_ID) {
-      targets.add(LINE_USER_ID);
-    }
+  // 固定通知
+  if (LINE_USER_ID) targets.add(LINE_USER_ID);
 
-    // 担当者通知（今回は同じID）
-    const assigneeId = LINE_USER_MAP[assignee];
-    if (assigneeId) {
-      targets.add(assigneeId);
-    }
+  // 担当者通知
+  const userId = LINE_USER_MAP[assignee];
+  if (userId) targets.add(userId);
 
-    console.log("WEBHOOK TARGETS:", [...targets]);
-
-    for (const userId of targets) {
-      await pushLineMessageTo(userId, message);
-    }
-
-    res.status(200).send("OK");
-  } catch (error) {
-    console.error("WEBHOOK ERROR:", error.response?.data || error.message);
-    res.status(500).send("ERROR");
+  for (const id of targets) {
+    await pushLineMessageTo(id, message);
   }
+
+  res.send("OK");
 });
 
 app.listen(PORT, () => {
