@@ -5,14 +5,58 @@ const axios = require("axios");
 const app = express();
 app.use(express.json());
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3001;
+
+// ===== 環境変数 =====
+const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
+
+const JIRA_BASE_URL = process.env.JIRA_BASE_URL;
+const JIRA_EMAIL = process.env.JIRA_EMAIL;
+const JIRA_API_TOKEN = process.env.JIRA_API_TOKEN;
+
+// ===== Jiraカスタムフィールド =====
+const ACTION_FIELD_ID = "customfield_10118";
+
+// ===== 認証 =====
+function getJiraHeaders() {
+  const auth = Buffer.from(`${JIRA_EMAIL}:${JIRA_API_TOKEN}`).toString("base64");
+  return {
+    Authorization: `Basic ${auth}`,
+    Accept: "application/json",
+    "Content-Type": "application/json"
+  };
+}
+
+// ===== LINE返信 =====
+async function replyLine(replyToken, message) {
+  const response = await axios.post(
+    "https://api.line.me/v2/bot/message/reply",
+    {
+      replyToken,
+      messages: [
+        {
+          type: "text",
+          text: message
+        }
+      ]
+    },
+    {
+      headers: {
+        Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
+        "Content-Type": "application/json"
+      }
+    }
+  );
+
+  console.log("LINE REPLY OK:", response.status);
+}
 
 // ===== メッセージ解析 =====
 function parseMessage(text) {
-  const parts = text.split("|");
+  const parts = text.trim().split("|").map((p) => p.trim());
 
   if (parts.length < 6) {
-    throw new Error("形式：プロジェクト|種別|件名|期限|担当|詳細");
+    throw new Error("形式: プロジェクト | 種別 | 件名 | 期限 | 担当 | 詳細");
   }
 
   return {
@@ -20,143 +64,101 @@ function parseMessage(text) {
     issueType: parts[1],
     summary: parts[2],
     dueDate: parts[3],
-    assigneeName: parts[4],
-    description: parts[5],
+    assignee: parts[4],
+    description: parts[5]
   };
 }
 
-// ===== Jiraユーザー検索（名前→accountId）=====
-async function getAccountIdByName(name) {
-  if (!name) return null;
+// ===== 担当者取得（完全一致のみ）=====
+async function resolveAssigneeAccountId(query) {
+  if (!query) return null;
 
   const res = await axios.get(
-    `${process.env.JIRA_BASE_URL}/rest/api/3/user/search?query=${encodeURIComponent(
-      name
-    )}`,
+    `${JIRA_BASE_URL}/rest/api/3/user/search`,
     {
-      headers: {
-        Authorization:
-          "Basic " +
-          Buffer.from(
-            `${process.env.JIRA_EMAIL}:${process.env.JIRA_API_TOKEN}`
-          ).toString("base64"),
-        Accept: "application/json",
-      },
+      headers: getJiraHeaders(),
+      params: { query }
     }
   );
 
-  if (res.data.length > 0) {
-    return res.data[0].accountId;
+  const users = res.data || [];
+
+  const exactUser = users.find(
+    (u) => (u.displayName || "").trim() === query.trim()
+  );
+
+  if (!exactUser) {
+    throw new Error(`担当者が見つかりません: ${query}`);
   }
 
-  return null;
+  return exactUser.accountId;
 }
 
-// ===== Jiraチケット作成 =====
-async function createJiraIssue(task) {
-  const accountId = await getAccountIdByName(task.assigneeName);
-
-  const data = {
-    fields: {
-      project: {
-        key: task.projectKey,
-      },
-      summary: task.summary,
-      description: {
-        type: "doc",
-        version: 1,
-        content: [
-          {
-            type: "paragraph",
-            content: [
-              {
-                type: "text",
-                text: task.description,
-              },
-            ],
-          },
-        ],
-      },
-      issuetype: {
-        name: task.issueType,
-      },
-      duedate: task.dueDate,
-    },
+// ===== Jira作成 =====
+async function createJira(task) {
+  const fields = {
+    project: { key: task.projectKey },
+    summary: task.summary,
+    issuetype: { name: task.issueType },
+    duedate: task.dueDate,
+    [ACTION_FIELD_ID]: task.description || ""
   };
 
-  // 担当者がいる場合のみセット
-  if (accountId) {
-    data.fields.assignee = {
-      accountId: accountId,
-    };
+  if (task.assignee) {
+    const accountId = await resolveAssigneeAccountId(task.assignee);
+    fields.assignee = { accountId };
   }
 
+  console.log("JIRA CREATE FIELDS:", JSON.stringify(fields, null, 2));
+
   const res = await axios.post(
-    `${process.env.JIRA_BASE_URL}/rest/api/3/issue`,
-    data,
-    {
-      headers: {
-        Authorization:
-          "Basic " +
-          Buffer.from(
-            `${process.env.JIRA_EMAIL}:${process.env.JIRA_API_TOKEN}`
-          ).toString("base64"),
-        Accept: "application/json",
-        "Content-Type": "application/json",
-      },
-    }
+    `${JIRA_BASE_URL}/rest/api/3/issue`,
+    { fields },
+    { headers: getJiraHeaders() }
   );
 
-  return res.data.key;
+  console.log("JIRA CREATE OK:", res.data);
+
+  return res.data;
 }
 
-// ===== LINE Webhook =====
+// ===== Webhook =====
 app.post("/webhook", async (req, res) => {
-  try {
-    const events = req.body.events;
+  console.log("WEBHOOK BODY:", JSON.stringify(req.body, null, 2));
 
-    for (const e of events) {
-      if (e.type === "message" && e.message.type === "text") {
-        const text = e.message.text;
+  const events = req.body.events || [];
 
-        console.log("RAW TEXT:", text);
+  for (const e of events) {
+    if (e.type !== "message") continue;
+    if (!e.message || e.message.type !== "text") continue;
 
-        const task = parseMessage(text);
+    try {
+      console.log("RAW TEXT:", e.message.text);
 
-        const issueKey = await createJiraIssue(task);
+      const task = parseMessage(e.message.text);
+      const result = await createJira(task);
 
-        await axios.post(
-          "https://api.line.me/v2/bot/message/reply",
-          {
-            replyToken: e.replyToken,
-            messages: [
-              {
-                type: "text",
-                text: `作成成功: ${issueKey}`,
-              },
-            ],
-          },
-          {
-            headers: {
-              Authorization: `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}`,
-              "Content-Type": "application/json",
-            },
-          }
+      await replyLine(e.replyToken, `作成成功: ${result.key}`);
+    } catch (err) {
+      console.error("ERROR MESSAGE:", err.message);
+      console.error(
+        "ERROR DATA:",
+        JSON.stringify(err.response?.data, null, 2)
+      );
+
+      try {
+        await replyLine(e.replyToken, `失敗: ${err.message}`);
+      } catch (replyErr) {
+        console.error("LINE REPLY ERROR:", replyErr.message);
+        console.error(
+          "LINE REPLY ERROR DATA:",
+          JSON.stringify(replyErr.response?.data, null, 2)
         );
       }
     }
-
-    res.status(200).send("OK");
-  } catch (err) {
-    console.error(err.message);
-
-    // エラー時もLINEに返す
-    if (err.response) {
-      console.error(err.response.data);
-    }
-
-    res.status(200).send("ERROR");
   }
+
+  res.status(200).end();
 });
 
 // ===== 起動 =====
