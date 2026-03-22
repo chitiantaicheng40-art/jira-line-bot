@@ -9,12 +9,11 @@ const PORT = process.env.PORT || 3001;
 
 // ===== 環境変数 =====
 const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
-
 const JIRA_BASE_URL = process.env.JIRA_BASE_URL;
 const JIRA_EMAIL = process.env.JIRA_EMAIL;
 const JIRA_API_TOKEN = process.env.JIRA_API_TOKEN;
 
-// ===== Jiraカスタムフィールド =====
+// ===== OPS専用カスタムフィールド =====
 const ACTION_FIELD_ID = "customfield_10118";
 
 // ===== 認証 =====
@@ -29,7 +28,7 @@ function getJiraHeaders() {
 
 // ===== LINE返信 =====
 async function replyLine(replyToken, message) {
-  const response = await axios.post(
+  await axios.post(
     "https://api.line.me/v2/bot/message/reply",
     {
       replyToken,
@@ -47,8 +46,25 @@ async function replyLine(replyToken, message) {
       }
     }
   );
+}
 
-  console.log("LINE REPLY OK:", response.status);
+// ===== ADF形式のdescription作成 =====
+function buildDescriptionADF(text) {
+  return {
+    type: "doc",
+    version: 1,
+    content: [
+      {
+        type: "paragraph",
+        content: [
+          {
+            type: "text",
+            text: text || ""
+          }
+        ]
+      }
+    ]
+  };
 }
 
 // ===== メッセージ解析 =====
@@ -100,9 +116,16 @@ async function createJira(task) {
     project: { key: task.projectKey },
     summary: task.summary,
     issuetype: { name: task.issueType },
-    duedate: task.dueDate,
-    [ACTION_FIELD_ID]: task.description || ""
+    duedate: task.dueDate
   };
+
+  // OPSだけ「アクション内容」に入れる
+  if (task.projectKey === "OPS") {
+    fields[ACTION_FIELD_ID] = task.description || "";
+  } else {
+    // OPS以外は通常のdescriptionに入れる
+    fields.description = buildDescriptionADF(task.description);
+  }
 
   if (task.assignee) {
     const accountId = await resolveAssigneeAccountId(task.assignee);
@@ -124,8 +147,6 @@ async function createJira(task) {
 
 // ===== Webhook =====
 app.post("/webhook", async (req, res) => {
-  console.log("WEBHOOK BODY:", JSON.stringify(req.body, null, 2));
-
   const events = req.body.events || [];
 
   for (const e of events) {
