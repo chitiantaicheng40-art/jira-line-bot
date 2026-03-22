@@ -4,7 +4,7 @@ const express = require("express");
 const app = express();
 app.use(express.json());
 
-const PORT = process.env.PORT || 3001;
+const PORT = process.env.PORT || 10000;
 const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 const LINE_USER_ID_DEFAULT = process.env.LINE_USER_ID_DEFAULT;
 
@@ -61,16 +61,19 @@ async function pushLineMessage(to, text) {
   return body;
 }
 
+// ✅ ヘルスチェック
 app.get("/health", (_req, res) => {
   res.status(200).send("OK");
 });
 
-app.post("/line/webhook", (req, res) => {
+// ✅ LINE Webhook（ここ修正済み）
+app.post("/webhook", (req, res) => {
   console.log("=== LINE WEBHOOK ===");
   console.log(JSON.stringify(req.body, null, 2));
   res.status(200).end();
 });
 
+// ✅ Jira → LINE通知
 app.post("/jira", async (req, res) => {
   try {
     const body = req.body || {};
