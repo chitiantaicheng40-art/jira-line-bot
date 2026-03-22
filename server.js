@@ -65,11 +65,9 @@ function parseMessage(text) {
   };
 }
 
-// ===== Jiraユーザー検索 → accountId取得（完全一致のみ） =====
+// ===== Jiraユーザー検索 =====
 async function resolveAssigneeAccountId(query) {
   if (!query) return null;
-
-  const normalized = query.trim().toLowerCase();
 
   const response = await axios.get(
     `${JIRA_BASE_URL}/rest/api/3/user/search`,
@@ -81,27 +79,15 @@ async function resolveAssigneeAccountId(query) {
 
   const users = response.data || [];
 
-  console.log(
-    "USER SEARCH RESULT:",
-    JSON.stringify(
-      users.map((u) => ({
-        displayName: u.displayName,
-        accountId: u.accountId
-      })),
-      null,
-      2
-    )
+  const exact = users.find(
+    (u) => (u.displayName || "").trim() === query.trim()
   );
 
-  const exactDisplayName = users.find(
-    (u) => (u.displayName || "").trim().toLowerCase() === normalized
-  );
-
-  if (!exactDisplayName) {
+  if (!exact) {
     throw new Error(`担当者が見つかりません: ${query}`);
   }
 
-  return exactDisplayName.accountId;
+  return exact.accountId;
 }
 
 // ===== Jira作成 =====
@@ -111,6 +97,8 @@ async function createJira(task) {
     summary: task.summary,
     issuetype: { name: task.issueType },
     duedate: task.dueDate,
+
+    // 🔥 ここが超重要（description修正）
     description: {
       type: "doc",
       version: 1,
@@ -129,17 +117,13 @@ async function createJira(task) {
   };
 
   if (task.assignee) {
-    const assigneeAccountId = await resolveAssigneeAccountId(task.assignee);
-    fields.assignee = { accountId: assigneeAccountId };
+    const accountId = await resolveAssigneeAccountId(task.assignee);
+    fields.assignee = { accountId };
   }
-
-  const payload = { fields };
-
-  console.log("JIRA PAYLOAD:", JSON.stringify(payload, null, 2));
 
   const response = await axios.post(
     `${JIRA_BASE_URL}/rest/api/3/issue`,
-    payload,
+    { fields },
     {
       headers: getJiraHeaders()
     }
@@ -155,23 +139,14 @@ app.post("/webhook", async (req, res) => {
 
     for (const e of events) {
       if (e.type !== "message") continue;
-      if (!e.message || e.message.type !== "text") continue;
 
       try {
-        const text = e.message.text;
-        console.log("RAW TEXT:", text);
-
-        const task = parseMessage(text);
+        const task = parseMessage(e.message.text);
         const result = await createJira(task);
 
         await replyLine(e.replyToken, `作成成功: ${result.key}`);
       } catch (err) {
-        console.error("ERROR MESSAGE:", err.message);
-        console.error(
-          "ERROR DATA:",
-          JSON.stringify(err.response?.data, null, 2)
-        );
-
+        console.error(err.response?.data || err.message);
         await replyLine(e.replyToken, `失敗: ${err.message}`);
       }
     }
@@ -183,7 +158,6 @@ app.post("/webhook", async (req, res) => {
   }
 });
 
-// ===== 起動 =====
 app.listen(PORT, () => {
   console.log("Server running:", PORT);
 });
