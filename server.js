@@ -20,6 +20,22 @@ const JIRA_BASE_URL = process.env.JIRA_BASE_URL;
 const JIRA_EMAIL = process.env.JIRA_EMAIL;
 const JIRA_API_TOKEN = process.env.JIRA_API_TOKEN;
 
+// ===== Jira カスタムフィールド =====
+const CATEGORY_FIELD_ID = "customfield_10117"; // カテゴリ
+const ACTION_FIELD_ID = "customfield_10118";   // アクション内容
+
+// ===== 利用可能カテゴリ =====
+const ALLOWED_CATEGORIES = [
+  "営業",
+  "採用",
+  "財務",
+  "顧客対応",
+  "開発",
+  "マーケティング",
+  "経営",
+  "なし",
+];
+
 // ===== Middleware =====
 app.use("/webhook", express.json());
 app.use("/callback", express.raw({ type: "*/*" }));
@@ -92,10 +108,17 @@ function normalizePriority(priority) {
 }
 
 // ===== プロジェクトキー正規化 =====
-function normalizeProjectKey(projectKey) {
-  const key = String(projectKey || "").trim().toUpperCase();
-  if (["OPS", "SALES", "HR"].includes(key)) return key;
+function normalizeProjectKey() {
   return "OPS";
+}
+
+// ===== カテゴリ正規化 =====
+function normalizeCategory(category) {
+  const c = String(category || "").trim();
+  if (ALLOWED_CATEGORIES.includes(c)) {
+    return c;
+  }
+  return "なし";
 }
 
 // ===== LINE送信 =====
@@ -135,6 +158,8 @@ async function replyLineMessage(replyToken, text) {
 }
 
 // ===== AIで自然文 → Jira形式変換 =====
+// 形式:
+// project|issueType|summary|dueDate|assigneeName|priority|category|description
 async function convertToJiraFormat(text) {
   const { todayStr, tomorrowStr } = getTodayAndTomorrowJST();
 
@@ -142,13 +167,10 @@ async function convertToJiraFormat(text) {
 あなたは業務アシスタントです。
 ユーザーの自然文を、必ず次の形式1行だけに変換してください。
 
-project|issueType|summary|dueDate|assigneeName|priority|description
+project|issueType|summary|dueDate|assigneeName|priority|category|description
 
 ルール:
-- project は OPS / SALES / HR のいずれか
-- 経営、社内運用、会議、管理、オペレーション系は OPS
-- 営業、提案、顧客対応、商談、資料作成、顧客フォロー系は SALES
-- 採用、候補者、面接、求人、スクリーニング、面談、採用要件系は HR
+- project は必ず OPS
 - issueType は必ず Task
 - dueDate は必ず YYYY-MM-DD
 - 「明日」は ${tomorrowStr}
@@ -162,6 +184,20 @@ project|issueType|summary|dueDate|assigneeName|priority|description
 - 「今週中」「対応お願い」「なるはや」は Medium
 - 「時間あるとき」「余裕あれば」「急ぎでない」は Low
 - priority が判断できなければ Medium
+
+- category は必ず次のいずれか1つ:
+  営業 / 採用 / 財務 / 顧客対応 / 開発 / マーケティング / 経営 / なし
+
+- 分類ルール:
+  - 営業資料、提案書、商談、見積、営業準備、アポ、顧客提案 → 営業
+  - 面接、候補者、求人、採用要件、スクリーニング → 採用
+  - 資金繰り、請求、入金、予算、資金調達、会計 → 財務
+  - 既存顧客フォロー、CS、問い合わせ対応、導入支援 → 顧客対応
+  - システム改修、バグ修正、実装、コード、API、Bot改善 → 開発
+  - SNS、広告、LP、導線、キャンペーン、集客 → マーケティング
+  - 事業方針、全体整理、経営会議、戦略検討 → 経営
+  - 判定できなければ なし
+
 - summary は短く具体的に。句読点は不要
 - description は補足内容。補足が薄ければ簡潔に補完してよい
 - 区切り文字 | を summary や description に含めない
@@ -198,6 +234,8 @@ ${text}
 }
 
 // ===== 入力テキスト整形 =====
+// 最終形式:
+// project|issueType|summary|dueDate|assigneeName|priority|category|description
 async function normalizeInputForJira(text) {
   const trimmed = String(text || "").trim();
 
@@ -205,64 +243,131 @@ async function normalizeInputForJira(text) {
     throw new Error("入力が空です");
   }
 
+  let normalized;
+
   if (!trimmed.includes("|")) {
     const aiConverted = await convertToJiraFormat(trimmed);
     console.log("AI変換結果:", aiConverted);
-    return aiConverted;
+    normalized = aiConverted;
+  } else {
+    const parts = trimmed.split("|").map((v) => v.trim());
+
+    // 旧6項目
+    if (parts.length === 6) {
+      const [
+        projectKey,
+        issueType,
+        summary,
+        dueDate,
+        assigneeName,
+        description,
+      ] = parts;
+
+      normalized = [
+        normalizeProjectKey(projectKey),
+        issueType || "Task",
+        summary || "タイトル未設定",
+        dueDate || getTodayAndTomorrowJST().tomorrowStr,
+        assigneeName || "池田太晟",
+        "Medium",
+        "なし",
+        description || "補足なし",
+      ].join("|");
+    }
+    // 旧7項目
+    else if (parts.length === 7) {
+      const [
+        projectKey,
+        issueType,
+        summary,
+        dueDate,
+        assigneeName,
+        priorityName,
+        description,
+      ] = parts;
+
+      normalized = [
+        normalizeProjectKey(projectKey),
+        issueType || "Task",
+        summary || "タイトル未設定",
+        dueDate || getTodayAndTomorrowJST().tomorrowStr,
+        assigneeName || "池田太晟",
+        normalizePriority(priorityName),
+        "なし",
+        description || "補足なし",
+      ].join("|");
+    }
+    // 新8項目
+    else if (parts.length >= 8) {
+      const [
+        projectKey,
+        issueType,
+        summary,
+        dueDate,
+        assigneeName,
+        priorityName,
+        category,
+        ...rest
+      ] = parts;
+
+      const description = rest.join(" ").trim() || "補足なし";
+
+      normalized = [
+        normalizeProjectKey(projectKey),
+        issueType || "Task",
+        summary || "タイトル未設定",
+        dueDate || getTodayAndTomorrowJST().tomorrowStr,
+        assigneeName || "池田太晟",
+        normalizePriority(priorityName),
+        normalizeCategory(category),
+        description,
+      ].join("|");
+    } else {
+      throw new Error(
+        "形式エラー: project|issueType|summary|dueDate|assigneeName|priority|category|description"
+      );
+    }
   }
 
-  const parts = trimmed.split("|").map((v) => v.trim());
+  const { todayStr, tomorrowStr } = getTodayAndTomorrowJST();
+  const parts = normalized.split("|").map((v) => v.trim());
 
-  // 旧形式: project|issueType|summary|dueDate|assigneeName|description
-  if (parts.length === 6) {
-    const [
-      projectKey,
-      issueType,
-      summary,
-      dueDate,
-      assigneeName,
-      description,
-    ] = parts;
-
-    return [
-      normalizeProjectKey(projectKey),
-      issueType || "Task",
-      summary || "タイトル未設定",
-      dueDate || getTodayAndTomorrowJST().tomorrowStr,
-      assigneeName || "池田太晟",
-      "Medium",
-      description || "補足なし",
-    ].join("|");
+  if (parts.length < 8) {
+    throw new Error("正規化後の形式が不正です");
   }
 
-  // 新形式: project|issueType|summary|dueDate|assigneeName|priority|description
-  if (parts.length >= 7) {
-    const [
-      projectKey,
-      issueType,
-      summary,
-      dueDate,
-      assigneeName,
-      priorityName,
-      ...rest
-    ] = parts;
+  let [
+    projectKey,
+    issueType,
+    summary,
+    dueDate,
+    assigneeName,
+    priorityName,
+    category,
+    ...rest
+  ] = parts;
 
-    const description = rest.join(" ").trim() || "補足なし";
+  const description = rest.join(" ").trim() || "補足なし";
 
-    return [
-      normalizeProjectKey(projectKey),
-      issueType || "Task",
-      summary || "タイトル未設定",
-      dueDate || getTodayAndTomorrowJST().tomorrowStr,
-      assigneeName || "池田太晟",
-      normalizePriority(priorityName),
-      description,
-    ].join("|");
+  projectKey = "OPS";
+  category = normalizeCategory(category);
+
+  if (trimmed.includes("明日")) {
+    dueDate = tomorrowStr;
+  } else if (trimmed.includes("今日")) {
+    dueDate = todayStr;
   }
 
-  throw new Error(
-    "形式エラー: project|issueType|summary|dueDate|assigneeName|priority|description で入力してください"
-  );
+  return [
+    projectKey,
+    issueType || "Task",
+    summary || "タイトル未設定",
+    dueDate,
+    assigneeName || "池田太晟",
+    normalizePriority(priorityName),
+    category,
+    description,
+  ].join("|");
 }
 
 // ===== Jira説明欄（ADF） =====
@@ -288,9 +393,9 @@ function buildAdfDescription(text) {
 async function createJiraIssueFromText(rawText) {
   const parts = rawText.split("|").map((v) => v.trim());
 
-  if (parts.length < 7) {
+  if (parts.length < 8) {
     throw new Error(
-      "形式エラー: project|issueType|summary|dueDate|assigneeName|priority|description で入力してください"
+      "形式エラー: project|issueType|summary|dueDate|assigneeName|priority|category|description"
     );
   }
 
@@ -301,6 +406,7 @@ async function createJiraIssueFromText(rawText) {
     dueDateRaw,
     assigneeNameRaw,
     priorityNameRaw,
+    categoryRaw,
     ...descRest
   ] = parts;
 
@@ -310,6 +416,7 @@ async function createJiraIssueFromText(rawText) {
   const dueDate = dueDateRaw || getTodayAndTomorrowJST().tomorrowStr;
   const assigneeName = assigneeNameRaw || "池田太晟";
   const priorityName = normalizePriority(priorityNameRaw);
+  const category = normalizeCategory(categoryRaw);
   const description = descRest.join(" ").trim() || "補足なし";
 
   const assigneeAccountId = ASSIGNEE_MAP[assigneeName];
@@ -327,9 +434,12 @@ async function createJiraIssueFromText(rawText) {
     description: buildAdfDescription(description),
   };
 
-  // OPS専用カスタムフィールドが必要なら残す
-  if (projectKey === "OPS") {
-    fields.customfield_10118 = description;
+  // OPSのアクション内容
+  fields[ACTION_FIELD_ID] = description;
+
+  // OPSのカテゴリ（選択式）
+  if (category !== "なし") {
+    fields[CATEGORY_FIELD_ID] = { value: category };
   }
 
   console.log("===== DEBUG START =====");
@@ -339,6 +449,7 @@ async function createJiraIssueFromText(rawText) {
   console.log("dueDate =", JSON.stringify(dueDate));
   console.log("assigneeName =", JSON.stringify(assigneeName));
   console.log("priorityName =", JSON.stringify(priorityName));
+  console.log("category =", JSON.stringify(category));
   console.log("description =", JSON.stringify(description));
   console.log("fields =", JSON.stringify(fields, null, 2));
   console.log("===== DEBUG END =====");
@@ -369,6 +480,7 @@ async function createJiraIssueFromText(rawText) {
         dueDate,
         assigneeName,
         priorityName,
+        category,
         description,
       },
     };
@@ -425,6 +537,7 @@ app.post("/callback", async (req, res) => {
 期限: ${normalized.dueDate}
 担当: ${normalized.assigneeName}
 優先度: ${normalized.priorityName}
+カテゴリ: ${normalized.category}
 内容: ${normalized.description}`
         );
       } catch (e) {
