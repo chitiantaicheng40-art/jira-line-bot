@@ -2,9 +2,14 @@ require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
 const crypto = require("crypto");
+const OpenAI = require("openai");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
 
 // ===== 環境変数 =====
 const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
@@ -83,6 +88,48 @@ async function replyLineMessage(replyToken, text) {
       },
     }
   );
+}
+
+// ===== AIで自然文 → Jira形式変換 =====
+async function convertToJiraFormat(text) {
+  const today = new Date();
+  const tomorrow = new Date(today);
+  tomorrow.setDate(today.getDate() + 1);
+
+  const yyyy = tomorrow.getFullYear();
+  const mm = String(tomorrow.getMonth() + 1).padStart(2, "0");
+  const dd = String(tomorrow.getDate()).padStart(2, "0");
+  const defaultDate = `${yyyy}-${mm}-${dd}`;
+
+  const prompt = `
+あなたは業務アシスタントです。
+ユーザーの自然文を、必ず次の形式1行だけに変換してください。
+
+OPS|Task|summary|dueDate|assigneeName|description
+
+ルール:
+- project は必ず OPS
+- issueType は必ず Task
+- dueDate は YYYY-MM-DD
+- 期日が曖昧なら ${defaultDate}
+- assigneeName は必ず「池田太晟」または「金澤将一」
+- 担当者が明記されていなければ「池田太晟」
+- summary は短く具体的に
+- description は補足内容
+- 余計な説明は書かない
+- 必ず1行のみ返す
+
+入力:
+${text}
+`;
+
+  const response = await openai.chat.completions.create({
+    model: "gpt-4.1-mini",
+    messages: [{ role: "user", content: prompt }],
+  });
+
+  const formatted = response.choices[0].message.content.trim();
+  return formatted;
 }
 
 // ===== Jira作成 =====
@@ -166,8 +213,18 @@ app.post("/callback", async (req, res) => {
       const text = event.message.text;
 
       try {
-        const jira = await createJiraIssueFromText(text);
-        await replyLineMessage(event.replyToken, `作成成功: ${jira.key}`);
+        let inputForJira = text;
+
+        if (!text.includes("|")) {
+          inputForJira = await convertToJiraFormat(text);
+          console.log("AI変換結果:", inputForJira);
+        }
+
+        const jira = await createJiraIssueFromText(inputForJira);
+        await replyLineMessage(
+          event.replyToken,
+          `作成成功: ${jira.key}\n内容: ${inputForJira}`
+        );
       } catch (e) {
         console.error("CALLBACK ERROR:", e.message);
         await replyLineMessage(event.replyToken, `エラー: ${e.message}`);
@@ -197,10 +254,8 @@ app.post("/webhook", async (req, res) => {
 
     const targets = new Set();
 
-    // 固定通知
     if (LINE_USER_ID) targets.add(LINE_USER_ID);
 
-    // 担当者通知
     const userId = LINE_USER_MAP[assignee];
     if (userId) targets.add(userId);
 
