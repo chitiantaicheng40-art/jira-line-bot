@@ -144,7 +144,8 @@ ${text}
 
 // ===== Jira作成 =====
 async function createJiraIssueFromText(rawText) {
-  const parts = rawText.split("|");
+  const parts = rawText.split("|").map((v) => v.trim());
+
   if (parts.length < 7) {
     throw new Error(
       "形式エラー: project|issueType|summary|dueDate|assigneeName|priority|description で入力してください"
@@ -178,6 +179,17 @@ async function createJiraIssueFromText(rawText) {
   if (projectKey === "OPS") {
     fields.customfield_10118 = description;
   }
+
+  console.log("===== DEBUG START =====");
+  console.log("projectKey =", JSON.stringify(projectKey));
+  console.log("issueType =", JSON.stringify(issueType));
+  console.log("summary =", JSON.stringify(summary));
+  console.log("dueDate =", JSON.stringify(dueDate));
+  console.log("assigneeName =", JSON.stringify(assigneeName));
+  console.log("priorityName =", JSON.stringify(priorityName));
+  console.log("description =", JSON.stringify(description));
+  console.log("fields =", JSON.stringify(fields, null, 2));
+  console.log("===== DEBUG END =====");
 
   try {
     const res = await axios.post(
@@ -236,12 +248,22 @@ app.post("/callback", async (req, res) => {
       try {
         let inputForJira = text;
 
-        // 旧フォーマット入力（6項目）を7項目へ補正
         if (text.includes("|")) {
-          const oldParts = text.split("|");
+          const oldParts = text.split("|").map((v) => v.trim());
+
           if (oldParts.length === 6) {
-            const [projectKey, issueType, summary, dueDate, assigneeName, description] = oldParts;
+            const [
+              projectKey,
+              issueType,
+              summary,
+              dueDate,
+              assigneeName,
+              description,
+            ] = oldParts;
+
             inputForJira = `${projectKey}|${issueType}|${summary}|${dueDate}|${assigneeName}|Medium|${description}`;
+          } else {
+            inputForJira = oldParts.join("|");
           }
         } else {
           inputForJira = await convertToJiraFormat(text);
@@ -258,7 +280,7 @@ app.post("/callback", async (req, res) => {
           assigneeName,
           priorityName,
           description,
-        ] = inputForJira.split("|");
+        ] = inputForJira.split("|").map((v) => v.trim());
 
         await replyLineMessage(
           event.replyToken,
