@@ -42,6 +42,30 @@ function validateLineSignature(body, signature) {
   return hash === signature;
 }
 
+// ===== 日本時間の YYYY-MM-DD =====
+function formatDateJST(date) {
+  const jst = new Date(date.toLocaleString("en-US", { timeZone: "Asia/Tokyo" }));
+  const yyyy = jst.getFullYear();
+  const mm = String(jst.getMonth() + 1).padStart(2, "0");
+  const dd = String(jst.getDate()).padStart(2, "0");
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function getTodayAndTomorrowJST() {
+  const now = new Date();
+  const todayJstBase = new Date(
+    now.toLocaleString("en-US", { timeZone: "Asia/Tokyo" })
+  );
+
+  const tomorrowJstBase = new Date(todayJstBase);
+  tomorrowJstBase.setDate(tomorrowJstBase.getDate() + 1);
+
+  return {
+    todayStr: formatDateJST(todayJstBase),
+    tomorrowStr: formatDateJST(tomorrowJstBase),
+  };
+}
+
 // ===== 名前 → Jira accountId =====
 const ASSIGNEE_MAP = {
   "池田太晟": "712020:49c2350d-16fc-457e-8b2b-159df43d77ad",
@@ -53,6 +77,26 @@ const LINE_USER_MAP = {
   "池田太晟": "Uba56ca108dd44ab8cd3b044670958c34",
   "金澤将一": "U743062d8c9d606c8a30c971bf1a650c5",
 };
+
+// ===== 優先度正規化 =====
+function normalizePriority(priority) {
+  const p = String(priority || "").trim().toLowerCase();
+
+  if (["high", "h", "最高", "高", "至急", "急ぎ", "最優先"].includes(p)) {
+    return "High";
+  }
+  if (["low", "l", "低"].includes(p)) {
+    return "Low";
+  }
+  return "Medium";
+}
+
+// ===== プロジェクトキー正規化 =====
+function normalizeProjectKey(projectKey) {
+  const key = String(projectKey || "").trim().toUpperCase();
+  if (["OPS", "SALES", "HR"].includes(key)) return key;
+  return "OPS";
+}
 
 // ===== LINE送信 =====
 async function pushLineMessageTo(userId, text) {
@@ -92,14 +136,7 @@ async function replyLineMessage(replyToken, text) {
 
 // ===== AIで自然文 → Jira形式変換 =====
 async function convertToJiraFormat(text) {
-  const today = new Date();
-  const tomorrow = new Date(today);
-  tomorrow.setDate(today.getDate() + 1);
-
-  const yyyy = tomorrow.getFullYear();
-  const mm = String(tomorrow.getMonth() + 1).padStart(2, "0");
-  const dd = String(tomorrow.getDate()).padStart(2, "0");
-  const defaultDate = `${yyyy}-${mm}-${dd}`;
+  const { todayStr, tomorrowStr } = getTodayAndTomorrowJST();
 
   const prompt = `
 あなたは業務アシスタントです。
@@ -113,20 +150,21 @@ project|issueType|summary|dueDate|assigneeName|priority|description
 - 営業、提案、顧客対応、商談、資料作成、顧客フォロー系は SALES
 - 採用、候補者、面接、求人、スクリーニング、面談、採用要件系は HR
 - issueType は必ず Task
-- dueDate は YYYY-MM-DD
-- 「明日」は明日の日付
-- 「今日中」は今日の日付
-- 期日が曖昧なら ${defaultDate}
+- dueDate は必ず YYYY-MM-DD
+- 「明日」は ${tomorrowStr}
+- 「今日」「今日中」は ${todayStr}
+- 期日が曖昧なら ${tomorrowStr}
 - assigneeName は必ず「池田太晟」または「金澤将一」
-- 「池田担当」や担当者記載なしは「池田太晟」
-- 「金澤担当」は「金澤将一」
-- priority は High / Medium / Low
+- 「池田担当」「池田」「自分」「担当者記載なし」は「池田太晟」
+- 「金澤担当」「金澤」は「金澤将一」
+- priority は必ず High / Medium / Low のいずれか
 - 「至急」「急ぎ」「今日中」「最優先」は High
 - 「今週中」「対応お願い」「なるはや」は Medium
 - 「時間あるとき」「余裕あれば」「急ぎでない」は Low
 - priority が判断できなければ Medium
-- summary は短く具体的に
-- description は補足内容
+- summary は短く具体的に。句読点は不要
+- description は補足内容。補足が薄ければ簡潔に補完してよい
+- 区切り文字 | を summary や description に含めない
 - 余計な説明は書かない
 - 必ず1行のみ返す
 
@@ -136,10 +174,114 @@ ${text}
 
   const response = await openai.chat.completions.create({
     model: "gpt-4.1-mini",
-    messages: [{ role: "user", content: prompt }],
+    temperature: 0,
+    messages: [
+      {
+        role: "system",
+        content:
+          "自然文をJira登録用の1行フォーマットに変換する。余計な説明は一切せず、必ず1行のみ返す。",
+      },
+      {
+        role: "user",
+        content: prompt,
+      },
+    ],
   });
 
-  return response.choices[0].message.content.trim();
+  const content = (response.choices?.[0]?.message?.content || "").trim();
+
+  if (!content || !content.includes("|")) {
+    throw new Error("AI変換結果が不正です");
+  }
+
+  return content.split("\n")[0].trim();
+}
+
+// ===== 入力テキスト整形 =====
+async function normalizeInputForJira(text) {
+  const trimmed = String(text || "").trim();
+
+  if (!trimmed) {
+    throw new Error("入力が空です");
+  }
+
+  if (!trimmed.includes("|")) {
+    const aiConverted = await convertToJiraFormat(trimmed);
+    console.log("AI変換結果:", aiConverted);
+    return aiConverted;
+  }
+
+  const parts = trimmed.split("|").map((v) => v.trim());
+
+  // 旧形式: project|issueType|summary|dueDate|assigneeName|description
+  if (parts.length === 6) {
+    const [
+      projectKey,
+      issueType,
+      summary,
+      dueDate,
+      assigneeName,
+      description,
+    ] = parts;
+
+    return [
+      normalizeProjectKey(projectKey),
+      issueType || "Task",
+      summary || "タイトル未設定",
+      dueDate || getTodayAndTomorrowJST().tomorrowStr,
+      assigneeName || "池田太晟",
+      "Medium",
+      description || "補足なし",
+    ].join("|");
+  }
+
+  // 新形式: project|issueType|summary|dueDate|assigneeName|priority|description
+  if (parts.length >= 7) {
+    const [
+      projectKey,
+      issueType,
+      summary,
+      dueDate,
+      assigneeName,
+      priorityName,
+      ...rest
+    ] = parts;
+
+    const description = rest.join(" ").trim() || "補足なし";
+
+    return [
+      normalizeProjectKey(projectKey),
+      issueType || "Task",
+      summary || "タイトル未設定",
+      dueDate || getTodayAndTomorrowJST().tomorrowStr,
+      assigneeName || "池田太晟",
+      normalizePriority(priorityName),
+      description,
+    ].join("|");
+  }
+
+  throw new Error(
+    "形式エラー: project|issueType|summary|dueDate|assigneeName|priority|description で入力してください"
+  );
+}
+
+// ===== Jira説明欄（ADF） =====
+function buildAdfDescription(text) {
+  return {
+    type: "doc",
+    version: 1,
+    content: [
+      {
+        type: "paragraph",
+        content: [
+          {
+            type: "text",
+            text: String(text || "補足なし"),
+          },
+        ],
+      },
+    ],
+  };
 }
 
 // ===== Jira作成 =====
@@ -153,14 +295,22 @@ async function createJiraIssueFromText(rawText) {
   }
 
   const [
-    projectKey,
-    issueType,
-    summary,
-    dueDate,
-    assigneeName,
-    priorityName,
-    description,
+    projectKeyRaw,
+    issueTypeRaw,
+    summaryRaw,
+    dueDateRaw,
+    assigneeNameRaw,
+    priorityNameRaw,
+    ...descRest
   ] = parts;
+
+  const projectKey = normalizeProjectKey(projectKeyRaw);
+  const issueType = issueTypeRaw || "Task";
+  const summary = summaryRaw || "タイトル未設定";
+  const dueDate = dueDateRaw || getTodayAndTomorrowJST().tomorrowStr;
+  const assigneeName = assigneeNameRaw || "池田太晟";
+  const priorityName = normalizePriority(priorityNameRaw);
+  const description = descRest.join(" ").trim() || "補足なし";
 
   const assigneeAccountId = ASSIGNEE_MAP[assigneeName];
   if (!assigneeAccountId) {
@@ -174,8 +324,10 @@ async function createJiraIssueFromText(rawText) {
     duedate: dueDate,
     assignee: { accountId: assigneeAccountId },
     priority: { name: priorityName },
+    description: buildAdfDescription(description),
   };
 
+  // OPS専用カスタムフィールドが必要なら残す
   if (projectKey === "OPS") {
     fields.customfield_10118 = description;
   }
@@ -208,7 +360,18 @@ async function createJiraIssueFromText(rawText) {
     );
 
     console.log("JIRA SUCCESS:", res.data);
-    return res.data;
+    return {
+      jira: res.data,
+      normalized: {
+        projectKey,
+        issueType,
+        summary,
+        dueDate,
+        assigneeName,
+        priorityName,
+        description,
+      },
+    };
   } catch (error) {
     console.error(
       "JIRA ERROR:",
@@ -246,53 +409,23 @@ app.post("/callback", async (req, res) => {
       const text = event.message.text;
 
       try {
-        let inputForJira = text;
+        const inputForJira = await normalizeInputForJira(text);
+        const result = await createJiraIssueFromText(inputForJira);
 
-        if (text.includes("|")) {
-          const oldParts = text.split("|").map((v) => v.trim());
-
-          if (oldParts.length === 6) {
-            const [
-              projectKey,
-              issueType,
-              summary,
-              dueDate,
-              assigneeName,
-              description,
-            ] = oldParts;
-
-            inputForJira = `${projectKey}|${issueType}|${summary}|${dueDate}|${assigneeName}|Medium|${description}`;
-          } else {
-            inputForJira = oldParts.join("|");
-          }
-        } else {
-          inputForJira = await convertToJiraFormat(text);
-          console.log("AI変換結果:", inputForJira);
-        }
-
-        const jira = await createJiraIssueFromText(inputForJira);
-
-        const [
-          projectKey,
-          issueType,
-          summary,
-          dueDate,
-          assigneeName,
-          priorityName,
-          description,
-        ] = inputForJira.split("|").map((v) => v.trim());
+        const jira = result.jira;
+        const normalized = result.normalized;
 
         await replyLineMessage(
           event.replyToken,
           `【タスク作成完了】
 キー: ${jira.key}
-プロジェクト: ${projectKey}
-種別: ${issueType}
-タイトル: ${summary}
-期限: ${dueDate}
-担当: ${assigneeName}
-優先度: ${priorityName}
-内容: ${description}`
+プロジェクト: ${normalized.projectKey}
+種別: ${normalized.issueType}
+タイトル: ${normalized.summary}
+期限: ${normalized.dueDate}
+担当: ${normalized.assigneeName}
+優先度: ${normalized.priorityName}
+内容: ${normalized.description}`
         );
       } catch (e) {
         console.error("CALLBACK ERROR:", e.message);
