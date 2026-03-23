@@ -19,7 +19,14 @@ const JIRA_API_TOKEN = process.env.JIRA_API_TOKEN;
 app.use("/webhook", express.json());
 app.use("/callback", express.raw({ type: "*/*" }));
 
-app.get("/", (req, res) => res.send("OK"));
+// ===== 疎通確認用 =====
+app.get("/", (req, res) => {
+  res.status(200).send("OK");
+});
+
+app.get("/health", (req, res) => {
+  res.status(200).send("ok");
+});
 
 // ===== LINE署名検証 =====
 function validateLineSignature(body, signature) {
@@ -82,7 +89,7 @@ async function replyLineMessage(replyToken, text) {
 async function createJiraIssueFromText(rawText) {
   const parts = rawText.split("|");
   if (parts.length < 6) {
-    throw new Error("形式エラー");
+    throw new Error("形式エラー: project|issueType|summary|dueDate|assigneeName|description で入力してください");
   }
 
   const [projectKey, issueType, summary, dueDate, assigneeName, description] = parts;
@@ -104,73 +111,108 @@ async function createJiraIssueFromText(rawText) {
     fields.customfield_10118 = description;
   }
 
-  const res = await axios.post(
-    `${JIRA_BASE_URL}/rest/api/3/issue`,
-    { fields },
-    {
-      auth: {
-        username: JIRA_EMAIL,
-        password: JIRA_API_TOKEN,
-      },
-    }
-  );
+  try {
+    const res = await axios.post(
+      `${JIRA_BASE_URL}/rest/api/3/issue`,
+      { fields },
+      {
+        auth: {
+          username: JIRA_EMAIL,
+          password: JIRA_API_TOKEN,
+        },
+        headers: {
+          Accept: "application/json",
+          "Content-Type": "application/json",
+        },
+      }
+    );
 
-  return res.data;
+    console.log("JIRA SUCCESS:", res.data);
+    return res.data;
+  } catch (error) {
+    console.error(
+      "JIRA ERROR:",
+      error.response?.status,
+      error.response?.data || error.message
+    );
+    throw new Error(
+      `Jira作成失敗: ${error.response?.status || ""} ${
+        typeof error.response?.data === "string"
+          ? error.response.data
+          : JSON.stringify(error.response?.data || error.message)
+      }`
+    );
+  }
 }
 
 // ===== LINE → Jira =====
 app.post("/callback", async (req, res) => {
-  const signature = req.headers["x-line-signature"];
-  const rawBody = req.body;
+  try {
+    const signature = req.headers["x-line-signature"];
+    const rawBody = req.body;
 
-  if (!validateLineSignature(rawBody, signature)) {
-    return res.status(401).send("Invalid signature");
-  }
-
-  const body = JSON.parse(rawBody.toString("utf8"));
-
-  for (const event of body.events) {
-    if (event.type !== "message") continue;
-
-    const text = event.message.text;
-
-    try {
-      const jira = await createJiraIssueFromText(text);
-      await replyLineMessage(event.replyToken, `作成成功: ${jira.key}`);
-    } catch (e) {
-      await replyLineMessage(event.replyToken, `エラー: ${e.message}`);
+    if (!validateLineSignature(rawBody, signature)) {
+      console.log("LINE SIGNATURE ERROR");
+      return res.status(401).send("Invalid signature");
     }
-  }
 
-  res.send("OK");
+    const body = JSON.parse(rawBody.toString("utf8"));
+    console.log("LINE EVENT:", JSON.stringify(body, null, 2));
+
+    for (const event of body.events) {
+      if (event.type !== "message") continue;
+      if (event.message.type !== "text") continue;
+
+      const text = event.message.text;
+
+      try {
+        const jira = await createJiraIssueFromText(text);
+        await replyLineMessage(event.replyToken, `作成成功: ${jira.key}`);
+      } catch (e) {
+        console.error("CALLBACK ERROR:", e.message);
+        await replyLineMessage(event.replyToken, `エラー: ${e.message}`);
+      }
+    }
+
+    res.status(200).send("OK");
+  } catch (error) {
+    console.error("CALLBACK FATAL ERROR:", error.message);
+    res.status(500).send("Internal Server Error");
+  }
 });
 
 // ===== Jira → LINE通知 =====
 app.post("/webhook", async (req, res) => {
-  const { issueKey, summary, assignee, priority, status } = req.body;
+  try {
+    console.log("JIRA WEBHOOK BODY:", JSON.stringify(req.body, null, 2));
 
-  const message =
-`【期限超過タスク⚠️】
+    const { issueKey, summary, assignee, priority, status } = req.body;
+
+    const message = `【期限超過タスク⚠️】
 キー: ${issueKey}
 タイトル: ${summary}
 担当者: ${assignee}
 優先度: ${priority}
 ステータス: ${status}`;
 
-  const targets = new Set();
+    const targets = new Set();
 
-  // 固定通知
-  if (LINE_USER_ID) targets.add(LINE_USER_ID);
+    // 固定通知
+    if (LINE_USER_ID) targets.add(LINE_USER_ID);
 
-  // 担当者通知
-  const userId = LINE_USER_MAP[assignee];
-  if (userId) targets.add(userId);
+    // 担当者通知
+    const userId = LINE_USER_MAP[assignee];
+    if (userId) targets.add(userId);
 
-  for (const id of targets) {
-    await pushLineMessageTo(id, message);
+    for (const id of targets) {
+      await pushLineMessageTo(id, message);
+    }
+
+    res.status(200).send("OK");
+  } catch (error) {
+    console.error("WEBHOOK ERROR:", error.response?.data || error.message);
+    res.status(500).send("Webhook Error");
   }
-
-  res.send("OK");
 });
 
 app.listen(PORT, () => {
