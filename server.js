@@ -105,15 +105,26 @@ async function convertToJiraFormat(text) {
 あなたは業務アシスタントです。
 ユーザーの自然文を、必ず次の形式1行だけに変換してください。
 
-OPS|Task|summary|dueDate|assigneeName|description
+project|issueType|summary|dueDate|assigneeName|priority|description
 
 ルール:
-- project は必ず OPS
+- project は OPS / SALES / HR のいずれか
+- 経営、社内運用、会議、管理、オペレーション系は OPS
+- 営業、提案、顧客対応、商談、資料作成、顧客フォロー系は SALES
+- 採用、候補者、面接、求人、スクリーニング、面談、採用要件系は HR
 - issueType は必ず Task
 - dueDate は YYYY-MM-DD
+- 「明日」は明日の日付
+- 「今日中」は今日の日付
 - 期日が曖昧なら ${defaultDate}
 - assigneeName は必ず「池田太晟」または「金澤将一」
-- 担当者が明記されていなければ「池田太晟」
+- 「池田担当」や担当者記載なしは「池田太晟」
+- 「金澤担当」は「金澤将一」
+- priority は High / Medium / Low
+- 「至急」「急ぎ」「今日中」「最優先」は High
+- 「今週中」「対応お願い」「なるはや」は Medium
+- 「時間あるとき」「余裕あれば」「急ぎでない」は Low
+- priority が判断できなければ Medium
 - summary は短く具体的に
 - description は補足内容
 - 余計な説明は書かない
@@ -128,18 +139,27 @@ ${text}
     messages: [{ role: "user", content: prompt }],
   });
 
-  const formatted = response.choices[0].message.content.trim();
-  return formatted;
+  return response.choices[0].message.content.trim();
 }
 
 // ===== Jira作成 =====
 async function createJiraIssueFromText(rawText) {
   const parts = rawText.split("|");
-  if (parts.length < 6) {
-    throw new Error("形式エラー: project|issueType|summary|dueDate|assigneeName|description で入力してください");
+  if (parts.length < 7) {
+    throw new Error(
+      "形式エラー: project|issueType|summary|dueDate|assigneeName|priority|description で入力してください"
+    );
   }
 
-  const [projectKey, issueType, summary, dueDate, assigneeName, description] = parts;
+  const [
+    projectKey,
+    issueType,
+    summary,
+    dueDate,
+    assigneeName,
+    priorityName,
+    description,
+  ] = parts;
 
   const assigneeAccountId = ASSIGNEE_MAP[assigneeName];
   if (!assigneeAccountId) {
@@ -152,6 +172,7 @@ async function createJiraIssueFromText(rawText) {
     issuetype: { name: issueType },
     duedate: dueDate,
     assignee: { accountId: assigneeAccountId },
+    priority: { name: priorityName },
   };
 
   if (projectKey === "OPS") {
@@ -215,15 +236,41 @@ app.post("/callback", async (req, res) => {
       try {
         let inputForJira = text;
 
-        if (!text.includes("|")) {
+        // 旧フォーマット入力（6項目）を7項目へ補正
+        if (text.includes("|")) {
+          const oldParts = text.split("|");
+          if (oldParts.length === 6) {
+            const [projectKey, issueType, summary, dueDate, assigneeName, description] = oldParts;
+            inputForJira = `${projectKey}|${issueType}|${summary}|${dueDate}|${assigneeName}|Medium|${description}`;
+          }
+        } else {
           inputForJira = await convertToJiraFormat(text);
           console.log("AI変換結果:", inputForJira);
         }
 
         const jira = await createJiraIssueFromText(inputForJira);
+
+        const [
+          projectKey,
+          issueType,
+          summary,
+          dueDate,
+          assigneeName,
+          priorityName,
+          description,
+        ] = inputForJira.split("|");
+
         await replyLineMessage(
           event.replyToken,
-          `作成成功: ${jira.key}\n内容: ${inputForJira}`
+          `【タスク作成完了】
+キー: ${jira.key}
+プロジェクト: ${projectKey}
+種別: ${issueType}
+タイトル: ${summary}
+期限: ${dueDate}
+担当: ${assigneeName}
+優先度: ${priorityName}
+内容: ${description}`
         );
       } catch (e) {
         console.error("CALLBACK ERROR:", e.message);
